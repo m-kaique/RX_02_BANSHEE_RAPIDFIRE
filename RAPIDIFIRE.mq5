@@ -8,6 +8,7 @@
 
 #include <Trade/Trade.mqh>
 #include "graph/graph_utils.mqh"
+#include "utils.mqh"
 
 //+------------------------------------------------------------------+
 //| PARÂMETROS DE ENTRADA - MINIMALISTAS                            |
@@ -71,6 +72,7 @@ struct SimpleAlBrooksData
    bool isUpTrend;
    double confidence;
    int activePatterns;
+   SETUP_QUALITY quality;
    string summary;
 };
 
@@ -104,6 +106,7 @@ public:
       data.smallPullbackDetected = false;
       data.activePatterns = 0;
       data.confidence = 0.0;
+      data.quality = SETUP_C;
 
       // 1. SPIKE DETECTION - 3 barras consecutivas fortes
       data.spikeDetected = DetectSpike(symbol, tf, data.isUpTrend);
@@ -122,6 +125,7 @@ public:
 
       // 4. CALCULAR CONFIANÇA
       data.confidence = CalculateConfidence(data);
+      data.quality = DetermineQuality(data);
 
       // 5. GERAR RESUMO
       data.summary = GenerateSummary(data);
@@ -136,7 +140,9 @@ private:
    bool DetectSpike(const string symbol, ENUM_TIMEFRAMES tf, bool &isUp)
    {
       const int bars = 3;
+      const int atrPeriod = 20;
       const double minBodyRatio = 0.6;
+      const double closePct = 0.2; // fechar no extremo
 
       bool upSpike = true, downSpike = true;
 
@@ -148,18 +154,60 @@ private:
          double low = iLow(symbol, tf, i);
          double range = high - low;
 
-         if (range <= 0)
+         double atr = GetATR(symbol, tf, atrPeriod, i);
+         if (range <= 0 || atr <= 0)
             return false;
 
          double body = MathAbs(close - open);
 
-         // Verificar spike de alta
-         if (close <= open || body < range * minBodyRatio)
-            upSpike = false;
+         bool strongUp = close > open && body >= range * minBodyRatio && range > atr * 1.5 && close >= high - range * closePct;
+         bool strongDown = close < open && body >= range * minBodyRatio && range > atr * 1.5 && close <= low + range * closePct;
 
-         // Verificar spike de baixa
-         if (close >= open || body < range * minBodyRatio)
+         if (!strongUp)
+            upSpike = false;
+         if (!strongDown)
             downSpike = false;
+      }
+
+      // permitir spike de uma barra seguida por continuidade
+      if (!upSpike && !downSpike)
+      {
+         double open1 = iOpen(symbol, tf, 1);
+         double close1 = iClose(symbol, tf, 1);
+         double high1 = iHigh(symbol, tf, 1);
+         double low1 = iLow(symbol, tf, 1);
+         double range1 = high1 - low1;
+         double atr1 = GetATR(symbol, tf, atrPeriod, 1);
+         double body1 = MathAbs(close1 - open1);
+         bool strongUp1 = close1 > open1 && body1 >= range1 * minBodyRatio && range1 > atr1 * 1.5 && close1 >= high1 - range1 * closePct;
+         bool strongDown1 = close1 < open1 && body1 >= range1 * minBodyRatio && range1 > atr1 * 1.5 && close1 <= low1 + range1 * closePct;
+
+         if (strongUp1)
+         {
+            bool cont = true;
+            for (int i = 2; i <= bars; i++)
+            {
+               if (iClose(symbol, tf, i) <= iClose(symbol, tf, i - 1))
+               {
+                  cont = false; break;
+               }
+            }
+            if (cont)
+               upSpike = true;
+         }
+         if (strongDown1)
+         {
+            bool cont = true;
+            for (int i = 2; i <= bars; i++)
+            {
+               if (iClose(symbol, tf, i) >= iClose(symbol, tf, i - 1))
+               {
+                  cont = false; break;
+               }
+            }
+            if (cont)
+               downSpike = true;
+         }
       }
 
       if (upSpike)
@@ -181,48 +229,58 @@ private:
    //+------------------------------------------------------------------+
    bool DetectTrendFromOpen(const string symbol, ENUM_TIMEFRAMES tf, bool &isUp)
    {
-      // Pegar abertura do dia
       datetime dayStart = iTime(symbol, PERIOD_D1, 0);
       int dayStartBar = iBarShift(symbol, tf, dayStart);
 
-      if (dayStartBar <= 0 || dayStartBar > 50)
+      if (dayStartBar <= 0)
          return false;
 
+      const int checkBars = 10; // analisar apenas início do dia
       double openPrice = iOpen(symbol, tf, dayStartBar);
-      double currentPrice = iClose(symbol, tf, 0);
+      bool isUpMove = iClose(symbol, tf, dayStartBar - 1) > openPrice;
 
-      // Contar barras consecutivas na direção
-      bool isUpMove = currentPrice > openPrice;
-      int consecutiveBars = 0;
-      double maxPullback = 0.0;
-      double totalMove = MathAbs(currentPrice - openPrice);
+      int strongCount = 0;
+      double highSinceOpen = openPrice;
+      double lowSinceOpen = openPrice;
 
-      for (int i = dayStartBar - 1; i >= 0; i--)
+      for (int i = dayStartBar - 1; i >= MathMax(dayStartBar - checkBars, 0); i--)
       {
+         double open = iOpen(symbol, tf, i);
          double close = iClose(symbol, tf, i);
-         double prevClose = iClose(symbol, tf, i + 1);
+         double high = iHigh(symbol, tf, i);
+         double low = iLow(symbol, tf, i);
+         double range = high - low;
+         double atr = GetATR(symbol, tf, 20, i);
+         if (atr <= 0 || range <= 0)
+            break;
 
-         if ((isUpMove && close > prevClose) || (!isUpMove && close < prevClose))
-         {
-            consecutiveBars++;
-         }
+         bool strongUp = close > open && close >= high - range * 0.2 && range > atr * 1.2;
+         bool strongDown = close < open && close <= low + range * 0.2 && range > atr * 1.2;
+
+         if ((isUpMove && strongUp) || (!isUpMove && strongDown))
+            strongCount++;
          else
-         {
-            double pullback = MathAbs(close - prevClose) / totalMove * 100.0;
-            if (pullback > maxPullback)
-               maxPullback = pullback;
-            if (pullback > m_maxPullback)
-               break;
-         }
+            break;
+
+         highSinceOpen = MathMax(highSinceOpen, high);
+         lowSinceOpen = MathMin(lowSinceOpen, low);
       }
 
-      if (consecutiveBars >= m_trendFromOpenMin && maxPullback <= m_maxPullback)
-      {
-         isUp = isUpMove;
-         return true;
-      }
+      if (strongCount < m_trendFromOpenMin)
+         return false;
 
-      return false;
+      double totalMove = MathAbs((isUpMove ? highSinceOpen : lowSinceOpen) - openPrice);
+      double current = iClose(symbol, tf, 0);
+      double pullback = MathAbs(current - (isUpMove ? highSinceOpen : lowSinceOpen));
+
+      if (totalMove <= 0)
+         return false;
+
+      if (pullback / totalMove > 0.4)
+         return false;
+
+      isUp = isUpMove;
+      return true;
    }
 
    //+------------------------------------------------------------------+
@@ -230,47 +288,47 @@ private:
    //+------------------------------------------------------------------+
    bool DetectSmallPullback(const string symbol, ENUM_TIMEFRAMES tf, bool &isUp)
    {
-      const int analyzeBars = 10;
-      double closes[];
-      ArrayResize(closes, analyzeBars);
+      const int analyzeBars = 15;
+      int consecutivePull = 0;
 
-      for (int i = 0; i < analyzeBars; i++)
-         closes[i] = iClose(symbol, tf, analyzeBars - 1 - i);
+      bool isUpTrend = iClose(symbol, tf, 0) > iClose(symbol, tf, analyzeBars);
+      double highest = iHigh(symbol, tf, analyzeBars);
+      double lowest = iLow(symbol, tf, analyzeBars);
 
-      bool isUpTrend = closes[analyzeBars - 1] > closes[0];
-      int pullbackCount = 0;
-      int strongCloses = 0;
-
-      for (int i = 1; i < analyzeBars - 1; i++)
+      for (int i = analyzeBars; i >= 0; i--)
       {
-         // Contar pullbacks pequenos
-         if ((isUpTrend && closes[i] < closes[i - 1]) ||
-             (!isUpTrend && closes[i] > closes[i - 1]))
+         double close = iClose(symbol, tf, i);
+         double ema = GetEMA(symbol, tf, 20, i);
+         highest = MathMax(highest, iHigh(symbol, tf, i));
+         lowest = MathMin(lowest, iLow(symbol, tf, i));
+
+         if (isUpTrend)
          {
-            pullbackCount++;
+            if (close < ema)
+               consecutivePull++;
+            else
+               consecutivePull = 0;
+         }
+         else
+         {
+            if (close > ema)
+               consecutivePull++;
+            else
+               consecutivePull = 0;
          }
 
-         // Contar fechamentos fortes
-         double high = iHigh(symbol, tf, analyzeBars - 1 - i);
-         double low = iLow(symbol, tf, analyzeBars - 1 - i);
-         double range = high - low;
-
-         if (range > 0)
-         {
-            if (isUpTrend && (high - closes[i]) / range <= 0.3)
-               strongCloses++;
-            if (!isUpTrend && (closes[i] - low) / range <= 0.3)
-               strongCloses++;
-         }
+         if (consecutivePull > 2)
+            return false;
       }
 
-      if (pullbackCount <= 2 && strongCloses >= analyzeBars * 0.6)
-      {
-         isUp = isUpTrend;
-         return true;
-      }
+      double leg = MathAbs(iClose(symbol, tf, 0) - (isUpTrend ? lowest : highest));
+      double pullDepth = MathAbs(iClose(symbol, tf, 0) - (isUpTrend ? highest : lowest));
 
-      return false;
+      if (leg <= 0 || pullDepth / leg > 0.4)
+         return false;
+
+      isUp = isUpTrend;
+      return true;
    }
 
    //+------------------------------------------------------------------+
@@ -278,17 +336,30 @@ private:
    //+------------------------------------------------------------------+
    double CalculateConfidence(const SimpleAlBrooksData &data)
    {
-      double baseConf = (data.activePatterns / 3.0) * 70.0; // Base até 70%
+      SETUP_QUALITY q = DetermineQuality(data);
+      switch(q)
+      {
+         case SETUP_A_PLUS: return 90.0;
+         case SETUP_A:      return 75.0;
+         case SETUP_B:      return 55.0;
+         default:           return 40.0;
+      }
+   }
 
-      // Bonus por padrões específicos
-      if (data.spikeDetected)
-         baseConf += 10.0;
-      if (data.trendFromOpenDetected)
-         baseConf += 15.0;
-      if (data.smallPullbackDetected)
-         baseConf += 5.0;
-
-      return MathMin(baseConf, 100.0);
+   //+------------------------------------------------------------------+
+   //| Determina qualidade do setup                                    |
+   //+------------------------------------------------------------------+
+   SETUP_QUALITY DetermineQuality(const SimpleAlBrooksData &data)
+   {
+      if (data.spikeDetected && data.trendFromOpenDetected && data.smallPullbackDetected)
+         return SETUP_A_PLUS;
+      if ((data.spikeDetected && data.trendFromOpenDetected) ||
+          (data.trendFromOpenDetected && data.smallPullbackDetected) ||
+          (data.spikeDetected && data.smallPullbackDetected))
+         return SETUP_A;
+      if (data.spikeDetected || data.trendFromOpenDetected || data.smallPullbackDetected)
+         return SETUP_B;
+      return SETUP_C;
    }
 
    //+------------------------------------------------------------------+
@@ -309,7 +380,16 @@ private:
       if (data.smallPullbackDetected)
          patterns += "SmallPull ";
 
-      return StringFormat("%s: %s(%.0f%%)", dir, patterns, data.confidence);
+      string qualityText;
+      switch(data.quality)
+      {
+         case SETUP_A_PLUS: qualityText = "A+"; break;
+         case SETUP_A:      qualityText = "A";  break;
+         case SETUP_B:      qualityText = "B";  break;
+         default:           qualityText = "C";  break;
+      }
+
+      return StringFormat("%s: %s[%s]", dir, patterns, qualityText);
    }
 };
 
@@ -411,6 +491,8 @@ void OnTick()
          ExecuteSignal(signal);
       }
    }
+
+   ManagePositions();
 }
 
 //+------------------------------------------------------------------+
@@ -444,35 +526,32 @@ Signal GenerateSignal(const SimpleAlBrooksData &data)
 
    // Determinar estratégia prioritária
    if (data.spikeDetected)
-   {
       sig.strategy = "AlBrooks_Spike";
-      sig.quality = SETUP_A;
-   }
    else if (data.trendFromOpenDetected)
-   {
       sig.strategy = "AlBrooks_TrendFromOpen";
-      sig.quality = SETUP_A;
-   }
-   else
-   {
+   else if (data.smallPullbackDetected)
       sig.strategy = "AlBrooks_SmallPullback";
-      sig.quality = SETUP_B;
-   }
+   else
+      sig.strategy = "AlBrooks";
 
-   // Calcular stop e target simples
-   double atr = iATR(_Symbol, _Period, 14, 1);
-   double stopDistance = atr * 1.5;
+   sig.quality = data.quality;
 
+   const int lookback = 20;
+   double buffer = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
    if (sig.direction == SIGNAL_BUY)
    {
-      sig.stop = sig.entry - stopDistance;
-      sig.target = sig.entry + (stopDistance * 2.0); // R/R 1:2
+      double swing = GetRecentSwingLow(_Symbol, _Period, lookback);
+      sig.stop = swing - buffer;
    }
    else
    {
-      sig.stop = sig.entry + stopDistance;
-      sig.target = sig.entry - (stopDistance * 2.0);
+      double swing = GetRecentSwingHigh(_Symbol, _Period, lookback);
+      sig.stop = swing + buffer;
    }
+
+   double risk = MathAbs(sig.entry - sig.stop);
+   sig.target = sig.entry + (sig.direction == SIGNAL_BUY ? risk : -risk) * 2.0;
+
 
    return sig;
 }
@@ -563,6 +642,37 @@ void PrintPatternDetails(const SimpleAlBrooksData &data)
       Print("  ✓ Trend from Open detectado");
    if (data.smallPullbackDetected)
       Print("  ✓ Small Pullback detectado");
+}
+
+//+------------------------------------------------------------------+
+//| Gerencia posições abertas com trailing simples                  |
+//+------------------------------------------------------------------+
+void ManagePositions()
+{
+   for(int i=PositionsTotal()-1; i>=0; i--)
+   {
+      if(PositionGetTicket(i)==0) continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+
+      ulong ticket=PositionGetTicket(i);
+      double open=PositionGetDouble(POSITION_PRICE_OPEN);
+      double stop=PositionGetDouble(POSITION_SL);
+      double take=PositionGetDouble(POSITION_TP);
+      int type=PositionGetInteger(POSITION_TYPE);
+
+      double price=(type==POSITION_TYPE_BUY)?SymbolInfoDouble(_Symbol,SYMBOL_BID):SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+      double risk=MathAbs(open-stop);
+      if(risk<=0) continue;
+
+      bool move=false;
+      if(type==POSITION_TYPE_BUY && price-open>=risk && stop<open)
+         move=true;
+      if(type==POSITION_TYPE_SELL && open-price>=risk && stop>open)
+         move=true;
+
+      if(move)
+         trade.PositionModify(ticket,open,take);
+   }
 }
 
 //+------------------------------------------------------------------+
